@@ -857,6 +857,93 @@ static bool detectSliderBounds(const Mat& gray, int barX, const Rect& searchRoi,
 	int bestRunLen = merged[bestIdx].len;
 
 	if (bestRunLen < minSliderHeight) return false;
+	// 防止误把整条轨道（或背景高亮）当成滑块
+	if (bestRunLen >= (int)((y2 - y1) * 0.95)) return false;
+
+	if (sliderTopOut) *sliderTopOut = bestRunStart;
+	if (sliderBottomOut) *sliderBottomOut = bestRunStart + bestRunLen;
+	if (sliderCenterYOut) *sliderCenterYOut = bestRunStart + bestRunLen / 2;
+	return true;
+}
+
+// ── 颜色检测（整段扫）：在整个轨道 ROI 内找滑块亮段的上下边界 ──
+// 思路：对 ROI 的每一行统计“亮色像素数量”，连续超过阈值的区间视为滑块
+// 这样就不依赖滑块模板给出的 barX，也更不怕被鱼遮挡导致模板偏移
+static bool detectSliderBoundsWide(const Mat& gray, const Rect& searchRoi,
+	int* sliderTopOut, int* sliderBottomOut, int* sliderCenterYOut,
+	int brightnessThresh = 180, int minSliderHeight = 15) {
+
+	Rect roi = clampRect(searchRoi, gray.size());
+	if (roi.width <= 0 || roi.height <= 0) return false;
+
+	int x1 = roi.x;
+	int x2 = roi.x + roi.width;
+	int y1 = roi.y;
+	int y2 = roi.y + roi.height;
+	if (x2 <= x1 || y2 <= y1) return false;
+
+	// 每行至少需要多少个“足够亮”的像素才算滑块范围
+	// ROI 宽度通常在 40~60 左右，滑块宽度约占其中一半；这里取一个较保守的比例
+	int minRowBright = roi.width / 8; // 约 12.5%
+	if (minRowBright < 4) minRowBright = 4;
+	if (minRowBright > roi.width) minRowBright = roi.width;
+
+	struct BrightRun { int start; int len; };
+	std::vector<BrightRun> runs;
+	int curRunStart = -1, curRunLen = 0;
+
+	for (int y = y1; y < y2; y++) {
+		const uchar* row = gray.ptr<uchar>(y);
+		int brightCnt = 0;
+		for (int x = x1; x < x2; x++) {
+			if (row[x] >= brightnessThresh) {
+				brightCnt++;
+			}
+		}
+
+		if (brightCnt >= minRowBright) {
+			if (curRunStart < 0) curRunStart = y;
+			curRunLen = y - curRunStart + 1;
+		} else {
+			if (curRunLen > 0) {
+				runs.push_back({ curRunStart, curRunLen });
+			}
+			curRunStart = -1;
+			curRunLen = 0;
+		}
+	}
+	if (curRunLen > 0) {
+		runs.push_back({ curRunStart, curRunLen });
+	}
+	if (runs.empty()) return false;
+
+	// 合并相邻亮段（鱼图标挡住滑块会把亮段切开）
+	int maxGap = config.slider_detect_merge_gap;
+	if (maxGap < 0) maxGap = 0;
+	std::vector<BrightRun> merged;
+	merged.push_back(runs[0]);
+	for (size_t i = 1; i < runs.size(); i++) {
+		BrightRun& last = merged.back();
+		int lastEnd = last.start + last.len;
+		int gap = runs[i].start - lastEnd;
+		if (gap <= maxGap) {
+			last.len = (runs[i].start + runs[i].len) - last.start;
+		} else {
+			merged.push_back(runs[i]);
+		}
+	}
+
+	// 取最长段
+	int bestIdx = 0;
+	for (size_t i = 1; i < merged.size(); i++) {
+		if (merged[i].len > merged[bestIdx].len) bestIdx = (int)i;
+	}
+	int bestRunStart = merged[bestIdx].start;
+	int bestRunLen = merged[bestIdx].len;
+
+	if (bestRunLen < minSliderHeight) return false;
+	// 防止误把整条轨道（或背景高亮）当成滑块
+	if (bestRunLen >= (int)(roi.height * 0.95)) return false;
 
 	if (sliderTopOut) *sliderTopOut = bestRunStart;
 	if (sliderBottomOut) *sliderBottomOut = bestRunStart + bestRunLen;
@@ -879,34 +966,39 @@ static bool fillFishSliderResult(const Mat& gray, const Rect& roi, const TplMatc
 
 	result->fishScore = fish.score;
 	result->sliderScore = slider.score;
-	if (fish.score < config.fish_icon_threshold || slider.score < config.slider_threshold) {
-		return false;
-	}
-
-	// 约束两者水平位置接近，避免 ROI 较大时出现"鱼/滑块各自匹配到不同 UI 元素"的误识别
-	int maxXDelta = params.tpl_vr_player_slider.cols() * 4;
-	if (maxXDelta < 60) maxXDelta = 60;
-	if (abs(fish.center.x - slider.center.x) > maxXDelta) {
+	if (fish.score < config.fish_icon_threshold) {
 		return false;
 	}
 
 	result->fishX = fish.center.x;
 	result->fishY = fish.center.y;
-	result->sliderCenterX = slider.center.x;
+	// 不再依赖滑块模板位置：默认用 fishX 作为滑块X（只用于日志/调试，控制只用 Y）
+	result->sliderCenterX = fish.center.x;
 	result->sliderCenterY = slider.center.y;
 
-	// 颜色检测：找滑块亮色区域的实际上下边界
+	// 颜色检测：优先在整个轨道 ROI 内扫亮度线条（不依赖滑块模板分数/位置）
+	// minSliderHeight 过小会把“鱼图标”这种短亮段误当成滑块，这里做个下限保护
+	int effectiveMinH = config.slider_min_height;
+	int fishTplH = params.tpl_vr_fish_icon.rows();
+	if (fishTplH > 0 && effectiveMinH < fishTplH + 5) effectiveMinH = fishTplH + 5;
 	int sliderTop = 0, sliderBottom = 0, sliderCenterFromColor = 0;
-	if (detectSliderBounds(gray, slider.center.x, roi,
+	if (detectSliderBoundsWide(gray, roi,
 		&sliderTop, &sliderBottom, &sliderCenterFromColor,
-		config.slider_bright_thresh, config.slider_min_height)) {
+		config.slider_bright_thresh, effectiveMinH)
+		// 兜底：若整段扫失败，再在 fishX 附近做一次窄条扫描
+		|| detectSliderBounds(gray, fish.center.x, roi,
+			&sliderTop, &sliderBottom, &sliderCenterFromColor,
+			config.slider_bright_thresh, effectiveMinH)) {
 		result->sliderTop = sliderTop;
 		result->sliderBottom = sliderBottom;
 		result->sliderHeight = sliderBottom - sliderTop;
 		result->sliderCenterY = sliderCenterFromColor;  // 用颜色检测的中心覆盖模板匹配的中心
 		result->hasBounds = true;
 	} else {
-		// 退回模板匹配结果：用模板高度估算边界
+		// 颜色检测失败 → 退回滑块模板（作为兜底）
+		if (slider.score < config.slider_threshold) {
+			return false;
+		}
 		int tplH = params.tpl_vr_player_slider.rows();
 		result->sliderTop = slider.center.y - tplH / 2;
 		result->sliderBottom = slider.center.y + tplH / 2;
@@ -1529,6 +1621,16 @@ void fishVrchat() {
 				double alpha = config.velocity_ema_alpha;
 				if (alpha < 0.05) alpha = 0.05;
 				if (alpha > 1.0) alpha = 1.0;
+
+				// 位置大跳变：速度估算直接作废（避免 [tpl]↔[color] 切换导致 sv 饱和）
+				if (hasPrevSlider) {
+					int jumpThresh = config.slider_tpl_jump_threshold;
+					if (jumpThresh < 50) jumpThresh = 50;
+					if (abs(sliderCY - prevSliderY) > jumpThresh) {
+						hasPrevSlider = false;
+						smoothVelocity = 0.0;
+					}
+				}
 
 				// MISS 恢复后或 dt 过大时：衰减速度（完全归零会让 MPC 误判）
 				if (wasLongMiss || dtMs > 300.0) {
