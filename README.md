@@ -117,7 +117,7 @@
 | `vrchat_fish` | `force_resolution` / `target_width` / `target_height` | 是否强制调整 VRChat 客户区分辨率 |
 | `vrchat_fish` | `capture_interval_ms` / `control_interval_ms` | 截图轮询与控制循环间隔 |
 | `vrchat_fish` | `bite_threshold` / `minigame_threshold` / `fish_icon_threshold` / `slider_threshold` | 关键模板匹配阈值（0~1） |
-| `vrchat_fish` | `fish_scale_*` / `track_scale_*` | 多尺度模板匹配缩放比（鱼图标/滑块轨道） |
+| `vrchat_fish` | `fish_scale_*` / `track_scale_*` / `track_scale_min`/`track_scale_max`/`track_scale_step` / `track_angle_min`/`track_angle_max`/`track_angle_step` | 多尺度模板匹配缩放比（鱼图标/滑块轨道）；轨道支持按范围自动扫尺度+小角度旋转匹配 |
 | `vrchat_fish` | `cleanup_*` / `cleanup_reel_key` | 结算/清理到下一轮：等待、点击次数、收杆按键等 |
 | `vrchat_fish` | `ml_mode` / `ml_record_csv` / `ml_weights_file` | 0=自动控制，1=录制数据，2=ML 推理 |
 | `vrchat_fish` | `debug` / `debug_pic` / `debug_dir` / `vr_log_file` | 调试输出、截图保存与 CSV 日志 |

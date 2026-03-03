@@ -105,6 +105,20 @@ struct g_config {
 	double track_scale_2;
 	double track_scale_3;
 	double track_scale_4;
+	// 轨道模板自动多尺度（优先级高于 track_scale_1~4）
+	double track_scale_min;
+	double track_scale_max;
+	double track_scale_step;
+	int track_scale_refine_topk;
+	double track_scale_refine_radius;
+	double track_scale_refine_step;
+	// 轨道模板旋转角度搜索（单位：度）
+	double track_angle_min;
+	double track_angle_max;
+	double track_angle_step;
+	int track_angle_refine_topk;
+	double track_angle_refine_radius;
+	double track_angle_refine_step;
 
 	int slider_detect_half_width;
 	int slider_detect_merge_gap;
@@ -214,6 +228,18 @@ void loadConfig() {
 	config.track_scale_2 = ini.getDouble("vrchat_fish", "track_scale_2", 1.0);
 	config.track_scale_3 = ini.getDouble("vrchat_fish", "track_scale_3", 1.2);
 	config.track_scale_4 = ini.getDouble("vrchat_fish", "track_scale_4", 1.5);
+	config.track_scale_min = ini.getDouble("vrchat_fish", "track_scale_min", 0.9);
+	config.track_scale_max = ini.getDouble("vrchat_fish", "track_scale_max", 2.0);
+	config.track_scale_step = ini.getDouble("vrchat_fish", "track_scale_step", 0.1);
+	config.track_scale_refine_topk = ini.getInt("vrchat_fish", "track_scale_refine_topk", 2);
+	config.track_scale_refine_radius = ini.getDouble("vrchat_fish", "track_scale_refine_radius", 0.05);
+	config.track_scale_refine_step = ini.getDouble("vrchat_fish", "track_scale_refine_step", 0.01);
+	config.track_angle_min = ini.getDouble("vrchat_fish", "track_angle_min", -2.0);
+	config.track_angle_max = ini.getDouble("vrchat_fish", "track_angle_max", 2.0);
+	config.track_angle_step = ini.getDouble("vrchat_fish", "track_angle_step", 0.2);
+	config.track_angle_refine_topk = ini.getInt("vrchat_fish", "track_angle_refine_topk", 2);
+	config.track_angle_refine_radius = ini.getDouble("vrchat_fish", "track_angle_refine_radius", 0.2);
+	config.track_angle_refine_step = ini.getDouble("vrchat_fish", "track_angle_refine_step", 0.05);
 	config.slider_detect_half_width = ini.getInt("vrchat_fish", "slider_detect_half_width", 4);
 	config.slider_detect_merge_gap = ini.getInt("vrchat_fish", "slider_detect_merge_gap", 40);
 	config.track_pad_y = ini.getInt("vrchat_fish", "track_pad_y", 30);
@@ -616,6 +642,415 @@ static TplMatch matchBestRoiAtScale(const Mat& srcGray, const g_params::GrayTpl&
 	out.rect.x += roi.x;
 	out.rect.y += roi.y;
 	return out;
+}
+
+static void sortUniqueScales(std::vector<double>& scales) {
+	std::sort(scales.begin(), scales.end());
+	std::vector<double> uniq;
+	uniq.reserve(scales.size());
+	for (double s : scales) {
+		if (!std::isfinite(s) || s <= 0.0) continue;
+		if (uniq.empty() || std::abs(uniq.back() - s) > 1e-6) {
+			uniq.push_back(s);
+		}
+	}
+	scales.swap(uniq);
+}
+
+static void sortUniqueAngles(std::vector<double>& angles) {
+	std::sort(angles.begin(), angles.end());
+	std::vector<double> uniq;
+	uniq.reserve(angles.size());
+	for (double a : angles) {
+		if (!std::isfinite(a)) continue;
+		if (uniq.empty() || std::abs(uniq.back() - a) > 1e-6) {
+			uniq.push_back(a);
+		}
+	}
+	angles.swap(uniq);
+}
+
+static std::vector<double> buildScaleRange(double minScale, double maxScale, double step, int maxCount = 128) {
+	std::vector<double> scales;
+	if (!std::isfinite(minScale) || !std::isfinite(maxScale) || !std::isfinite(step)) return scales;
+	if (step <= 0.0) return scales;
+	if (minScale > maxScale) std::swap(minScale, maxScale);
+	if (minScale <= 0.0 || maxScale <= 0.0) return scales;
+	if (maxCount < 2) maxCount = 2;
+
+	double span = maxScale - minScale;
+	int count = (int)std::floor(span / step + 1e-9) + 1;
+	if (count < 1) count = 1;
+	if (count > maxCount) {
+		// 防止极端配置导致卡死：自动放大步长，让总匹配次数受控
+		step = (span <= 0.0) ? step : (span / (double)(maxCount - 1));
+		count = maxCount;
+	}
+
+	scales.reserve(count + 1);
+	for (int i = 0; i < count; i++) {
+		double s = minScale + step * (double)i;
+		if (!std::isfinite(s) || s <= 0.0) continue;
+		scales.push_back(s);
+	}
+	// 强制包含 maxScale（避免浮点累加误差导致漏掉端点）
+	if (!scales.empty()) {
+		double last = scales.back();
+		if (std::abs(last - maxScale) > step * 0.25) {
+			scales.push_back(maxScale);
+		}
+	}
+	sortUniqueScales(scales);
+	return scales;
+}
+
+static std::vector<double> buildAngleRange(double minAngle, double maxAngle, double step, int maxCount = 256) {
+	std::vector<double> angles;
+	if (!std::isfinite(minAngle) || !std::isfinite(maxAngle) || !std::isfinite(step)) return angles;
+	if (step <= 0.0) return angles;
+	if (minAngle > maxAngle) std::swap(minAngle, maxAngle);
+	if (maxCount < 2) maxCount = 2;
+
+	double span = maxAngle - minAngle;
+	int count = (int)std::floor(span / step + 1e-9) + 1;
+	if (count < 1) count = 1;
+	if (count > maxCount) {
+		step = (span <= 0.0) ? step : (span / (double)(maxCount - 1));
+		count = maxCount;
+	}
+
+	angles.reserve(count + 1);
+	for (int i = 0; i < count; i++) {
+		double a = minAngle + step * (double)i;
+		if (!std::isfinite(a)) continue;
+		angles.push_back(a);
+	}
+	if (!angles.empty()) {
+		double last = angles.back();
+		if (std::abs(last - maxAngle) > step * 0.25) {
+			angles.push_back(maxAngle);
+		}
+	}
+	sortUniqueAngles(angles);
+	return angles;
+}
+
+static g_params::GrayTpl makeScaledTpl(const g_params::GrayTpl& tpl, double scale) {
+	g_params::GrayTpl scaled{};
+	if (tpl.empty()) return scaled;
+
+	if (!std::isfinite(scale) || scale <= 0.0 || std::abs(scale - 1.0) < 1e-6) {
+		scaled.gray = tpl.gray;
+		scaled.mask = tpl.mask;
+		return scaled;
+	}
+
+	int tw = std::max(1, (int)std::round(tpl.gray.cols * scale));
+	int th = std::max(1, (int)std::round(tpl.gray.rows * scale));
+	resize(tpl.gray, scaled.gray, Size(tw, th), 0, 0, INTER_AREA);
+	if (!tpl.mask.empty()) {
+		resize(tpl.mask, scaled.mask, Size(tw, th), 0, 0, INTER_NEAREST);
+	}
+	return scaled;
+}
+
+static g_params::GrayTpl rotateTplKeepAll(const g_params::GrayTpl& tpl, double angleDeg) {
+	g_params::GrayTpl out{};
+	if (tpl.empty()) return out;
+	if (!std::isfinite(angleDeg) || std::abs(angleDeg) < 1e-6) {
+		out.gray = tpl.gray;
+		out.mask = tpl.mask;
+		return out;
+	}
+
+	int w = tpl.gray.cols;
+	int h = tpl.gray.rows;
+	Point2f center((float)w / 2.0f, (float)h / 2.0f);
+
+	// 计算旋转后完整包围盒，避免裁剪
+	RotatedRect rr(center, Size2f((float)w, (float)h), (float)angleDeg);
+	Rect2f bbox = rr.boundingRect2f();
+	int outW = std::max(1, (int)std::ceil(bbox.width));
+	int outH = std::max(1, (int)std::ceil(bbox.height));
+
+	Mat M = getRotationMatrix2D(center, angleDeg, 1.0);
+	// 平移：让旋转后的图像位于输出画布中心
+	M.at<double>(0, 2) += (double)outW / 2.0 - center.x;
+	M.at<double>(1, 2) += (double)outH / 2.0 - center.y;
+
+	warpAffine(tpl.gray, out.gray, M, Size(outW, outH), INTER_LINEAR, BORDER_CONSTANT, Scalar(0));
+	if (!tpl.mask.empty()) {
+		warpAffine(tpl.mask, out.mask, M, Size(outW, outH), INTER_NEAREST, BORDER_CONSTANT, Scalar(0));
+	}
+	return out;
+}
+
+struct ScaleMatch {
+	double scale = 1.0;
+	TplMatch match{};
+};
+
+static TplMatch matchBestRoiMultiScaleCoarseToFine(
+	const Mat& srcGray,
+	const g_params::GrayTpl& tpl,
+	Rect roi,
+	const std::vector<double>& coarseScales,
+	int refineTopK,
+	double refineRadius,
+	double refineStep,
+	int method = TM_CCOEFF_NORMED,
+	double* bestScaleOut = nullptr
+) {
+	TplMatch best{};
+	if (srcGray.empty() || tpl.empty()) return best;
+
+	// 粗尺度匹配
+	double bestScale = 1.0;
+	std::vector<ScaleMatch> coarseMatches;
+	coarseMatches.reserve(coarseScales.size());
+
+	double coarseMin = 0.0, coarseMax = 0.0;
+	bool hasCoarseMinMax = false;
+
+	for (double s : coarseScales) {
+		if (!std::isfinite(s) || s <= 0.0) continue;
+
+		if (!hasCoarseMinMax) {
+			coarseMin = coarseMax = s;
+			hasCoarseMinMax = true;
+		} else {
+			if (s < coarseMin) coarseMin = s;
+			if (s > coarseMax) coarseMax = s;
+		}
+
+		TplMatch m = matchBestRoiAtScale(srcGray, tpl, roi, s, method);
+		coarseMatches.push_back(ScaleMatch{ s, m });
+		if (m.score > best.score) {
+			best = m;
+			bestScale = s;
+		}
+	}
+
+	// 没有有效尺度：fallback 到 1.0
+	if (coarseMatches.empty()) {
+		best = matchBestRoiAtScale(srcGray, tpl, roi, 1.0, method);
+		bestScale = 1.0;
+		if (bestScaleOut) *bestScaleOut = bestScale;
+		return best;
+	}
+
+	// 细分：围绕粗匹配 topK 的尺度再扫一遍
+	if (refineTopK < 1) refineTopK = 0;
+	if (!std::isfinite(refineRadius) || refineRadius <= 0.0) refineTopK = 0;
+	if (!std::isfinite(refineStep) || refineStep <= 0.0) refineTopK = 0;
+	if (!hasCoarseMinMax || coarseMax <= 0.0 || coarseMin <= 0.0) refineTopK = 0;
+
+	if (refineTopK > 0) {
+		std::sort(coarseMatches.begin(), coarseMatches.end(), [](const ScaleMatch& a, const ScaleMatch& b) {
+			return a.match.score > b.match.score;
+		});
+
+		std::vector<double> refineScales;
+		refineScales.reserve((size_t)refineTopK * 16);
+
+		for (int i = 0; i < (int)coarseMatches.size() && i < refineTopK; i++) {
+			const ScaleMatch& cand = coarseMatches[(size_t)i];
+			if (cand.match.score <= 0.0) break;
+
+			double s1 = cand.scale - refineRadius;
+			double s2 = cand.scale + refineRadius;
+			if (s1 < coarseMin) s1 = coarseMin;
+			if (s2 > coarseMax) s2 = coarseMax;
+			if (s2 <= s1) continue;
+
+			std::vector<double> seg = buildScaleRange(s1, s2, refineStep, 96);
+			refineScales.insert(refineScales.end(), seg.begin(), seg.end());
+		}
+
+		sortUniqueScales(refineScales);
+
+		for (double s : refineScales) {
+			TplMatch m = matchBestRoiAtScale(srcGray, tpl, roi, s, method);
+			if (m.score > best.score) {
+				best = m;
+				bestScale = s;
+			}
+		}
+	}
+
+	if (bestScaleOut) *bestScaleOut = bestScale;
+	return best;
+}
+
+struct AngleMatch {
+	double angleDeg = 0.0;
+	TplMatch match{};
+};
+
+static TplMatch matchBestRoiMultiAngleAtScaleCoarseToFine(
+	const Mat& srcGray,
+	const g_params::GrayTpl& tpl,
+	Rect roi,
+	double scale,
+	const std::vector<double>& coarseAngles,
+	int refineTopK,
+	double refineRadius,
+	double refineStep,
+	int method = TM_CCOEFF_NORMED,
+	double* bestAngleOut = nullptr
+) {
+	TplMatch best{};
+	if (srcGray.empty() || tpl.empty()) return best;
+
+	g_params::GrayTpl scaledTpl = makeScaledTpl(tpl, scale);
+	if (scaledTpl.empty()) return best;
+
+	double bestAngle = 0.0;
+	std::vector<AngleMatch> coarseMatches;
+	coarseMatches.reserve(coarseAngles.size());
+
+	double coarseMin = 0.0, coarseMax = 0.0;
+	bool hasCoarseMinMax = false;
+
+	for (double a : coarseAngles) {
+		if (!std::isfinite(a)) continue;
+		if (!hasCoarseMinMax) {
+			coarseMin = coarseMax = a;
+			hasCoarseMinMax = true;
+		} else {
+			if (a < coarseMin) coarseMin = a;
+			if (a > coarseMax) coarseMax = a;
+		}
+
+		g_params::GrayTpl rotated = rotateTplKeepAll(scaledTpl, a);
+		TplMatch m = matchBestRoi(srcGray, rotated, roi, method);
+		coarseMatches.push_back(AngleMatch{ a, m });
+		if (m.score > best.score) {
+			best = m;
+			bestAngle = a;
+		}
+	}
+
+	if (coarseMatches.empty()) {
+		// fallback: angle=0
+		g_params::GrayTpl rotated = rotateTplKeepAll(scaledTpl, 0.0);
+		best = matchBestRoi(srcGray, rotated, roi, method);
+		bestAngle = 0.0;
+		if (bestAngleOut) *bestAngleOut = bestAngle;
+		return best;
+	}
+
+	if (refineTopK < 1) refineTopK = 0;
+	if (!std::isfinite(refineRadius) || refineRadius <= 0.0) refineTopK = 0;
+	if (!std::isfinite(refineStep) || refineStep <= 0.0) refineTopK = 0;
+	if (!hasCoarseMinMax) refineTopK = 0;
+
+	if (refineTopK > 0) {
+		std::sort(coarseMatches.begin(), coarseMatches.end(), [](const AngleMatch& a, const AngleMatch& b) {
+			return a.match.score > b.match.score;
+		});
+
+		std::vector<double> refineAngles;
+		refineAngles.reserve((size_t)refineTopK * 16);
+
+		for (int i = 0; i < (int)coarseMatches.size() && i < refineTopK; i++) {
+			const AngleMatch& cand = coarseMatches[(size_t)i];
+			if (cand.match.score <= 0.0) break;
+
+			double a1 = cand.angleDeg - refineRadius;
+			double a2 = cand.angleDeg + refineRadius;
+			if (a1 < coarseMin) a1 = coarseMin;
+			if (a2 > coarseMax) a2 = coarseMax;
+			if (a2 <= a1) continue;
+
+			std::vector<double> seg = buildAngleRange(a1, a2, refineStep, 128);
+			refineAngles.insert(refineAngles.end(), seg.begin(), seg.end());
+		}
+
+		sortUniqueAngles(refineAngles);
+
+		for (double a : refineAngles) {
+			g_params::GrayTpl rotated = rotateTplKeepAll(scaledTpl, a);
+			TplMatch m = matchBestRoi(srcGray, rotated, roi, method);
+			if (m.score > best.score) {
+				best = m;
+				bestAngle = a;
+			}
+		}
+	}
+
+	if (bestAngleOut) *bestAngleOut = bestAngle;
+	return best;
+}
+
+static std::vector<double> buildTrackBarScales() {
+	std::vector<double> scales;
+	// 优先使用 range（0.9~2.0, step=0.1），便于适配不同分辨率/UI缩放
+	if (std::isfinite(config.track_scale_min) && std::isfinite(config.track_scale_max)
+		&& std::isfinite(config.track_scale_step)
+		&& config.track_scale_min > 0.0 && config.track_scale_max > 0.0 && config.track_scale_step > 0.0
+		&& config.track_scale_max >= config.track_scale_min) {
+		scales = buildScaleRange(config.track_scale_min, config.track_scale_max, config.track_scale_step, 128);
+	}
+	if (scales.empty()) {
+		scales = {
+			config.track_scale_1,
+			config.track_scale_2,
+			config.track_scale_3,
+			config.track_scale_4
+		};
+		sortUniqueScales(scales);
+	}
+	return scales;
+}
+
+static TplMatch matchBestRoiTrackBarAutoScale(
+	const Mat& srcGray,
+	const g_params::GrayTpl& tpl,
+	Rect roi,
+	int method = TM_CCOEFF_NORMED,
+	double* bestScaleOut = nullptr,
+	double* bestAngleOut = nullptr
+) {
+	std::vector<double> coarse = buildTrackBarScales();
+	double bestScale = 1.0;
+	TplMatch best = matchBestRoiMultiScaleCoarseToFine(
+		srcGray,
+		tpl,
+		roi,
+		coarse,
+		config.track_scale_refine_topk,
+		config.track_scale_refine_radius,
+		config.track_scale_refine_step,
+		method,
+		&bestScale
+	);
+	double bestAngle = 0.0;
+	if (std::isfinite(config.track_angle_min) && std::isfinite(config.track_angle_max)
+		&& std::isfinite(config.track_angle_step)
+		&& config.track_angle_step > 0.0) {
+		double aMin = config.track_angle_min;
+		double aMax = config.track_angle_max;
+		if (aMin > aMax) std::swap(aMin, aMax);
+		std::vector<double> angles = buildAngleRange(aMin, aMax, config.track_angle_step, 256);
+		if (!angles.empty()) {
+			best = matchBestRoiMultiAngleAtScaleCoarseToFine(
+				srcGray,
+				tpl,
+				roi,
+				bestScale,
+				angles,
+				config.track_angle_refine_topk,
+				config.track_angle_refine_radius,
+				config.track_angle_refine_step,
+				method,
+				&bestAngle
+			);
+		}
+	}
+	if (bestScaleOut) *bestScaleOut = bestScale;
+	if (bestAngleOut) *bestAngleOut = bestAngle;
+	return best;
 }
 
 static void activateGameWindowInner(bool forceCursorCenter) {
@@ -1429,21 +1864,16 @@ void fishVrchat() {
 
 			Rect searchRoi = centerThirdStripRoi(gray.size());
 
-			// ── 首帧：用 minigame_bar_full 模板定位完整轨道，取右半部分作为滑块/鱼检测 ROI ──
-			if (!hasFixedTrack) {
-				double barScale = 1.0;
-				const double trackScales[4] = {
-					config.track_scale_1,
-					config.track_scale_2,
-					config.track_scale_3,
-					config.track_scale_4
-				};
-				TplMatch barMatch = matchBestRoiMultiScaleByScales(gray, params.tpl_vr_minigame_bar_full, searchRoi,
-					trackScales, 4, TM_CCOEFF_NORMED, &barScale);
-				if (barMatch.score >= config.minigame_threshold) {
-					// 轨道定位成功：取匹配区域的右半部分作为滑块和鱼的检测区域
-					int trackX = barMatch.rect.x;
-					int trackW = barMatch.rect.width;
+					// ── 首帧：用 minigame_bar_full 模板定位完整轨道，取右半部分作为滑块/鱼检测 ROI ──
+					if (!hasFixedTrack) {
+						double barScale = 1.0;
+						double barAngle = 0.0;
+						TplMatch barMatch = matchBestRoiTrackBarAutoScale(gray, params.tpl_vr_minigame_bar_full, searchRoi,
+							TM_CCOEFF_NORMED, &barScale, &barAngle);
+						if (barMatch.score >= config.minigame_threshold) {
+						// 轨道定位成功：取匹配区域的右半部分作为滑块和鱼的检测区域
+						int trackX = barMatch.rect.x;
+						int trackW = barMatch.rect.width;
 					int trackY = barMatch.rect.y;
 					int trackH = barMatch.rect.height;
 					// 右半区域起点 = 匹配区域中点，宽度 = 一半宽度
@@ -1464,27 +1894,30 @@ void fishVrchat() {
 					saveDebugFrame(frame, "track_lock", searchRoi, barMatch.rect, fixedTrackRoi);
 					if (config.vr_debug || vrLogFile.is_open()) {
 						std::ostringstream oss;
-						oss << "[ctrl] track locked (full tpl): x=" << fixedTrackRoi.x
-							<< " y=" << fixedTrackRoi.y
-							<< " w=" << fixedTrackRoi.width
-							<< " h=" << fixedTrackRoi.height
-							<< " (bar score=" << barMatch.score
-							<< " scale=" << barScale << ")";
-						writeVrLogLine(oss.str(), config.vr_debug);
-					}
-				} else {
+							oss << "[ctrl] track locked (full tpl): x=" << fixedTrackRoi.x
+								<< " y=" << fixedTrackRoi.y
+								<< " w=" << fixedTrackRoi.width
+								<< " h=" << fixedTrackRoi.height
+								<< " (bar score=" << barMatch.score
+								<< " scale=" << barScale
+								<< " angle=" << barAngle << ")";
+							writeVrLogLine(oss.str(), config.vr_debug);
+						}
+					} else {
 					// debug: 蓝框=搜索区域, 绿框=匹配到的(错误)位置
 					saveDebugFrame(frame, "track_miss", searchRoi, barMatch.rect);
 					minigameMissingFrames++;
 					// 轨道长期定位不上（>= end_confirm_frames * N 帧）：放弃，退出小游戏
 					int trackLockMaxMiss = config.game_end_confirm_frames * config.track_lock_miss_multiplier;
 					if (trackLockMaxMiss < config.track_lock_miss_min_frames) trackLockMaxMiss = config.track_lock_miss_min_frames;
-					if (config.vr_debug || vrLogFile.is_open()) {
-						std::ostringstream oss;
-						oss << "[ctrl] track detect MISS (score=" << barMatch.score
-							<< ") miss=" << minigameMissingFrames << "/" << trackLockMaxMiss;
-						writeVrLogLine(oss.str(), config.vr_debug);
-					}
+						if (config.vr_debug || vrLogFile.is_open()) {
+								std::ostringstream oss;
+								oss << "[ctrl] track detect MISS (score=" << barMatch.score
+									<< " scale=" << barScale
+									<< " angle=" << barAngle
+									<< ") miss=" << minigameMissingFrames << "/" << trackLockMaxMiss;
+								writeVrLogLine(oss.str(), config.vr_debug);
+							}
 					if (minigameMissingFrames >= trackLockMaxMiss) {
 						if (holding) { mouseLeftUp(); holding = false; }
 						saveDebugFrame(frame, "track_lock_timeout", searchRoi);
