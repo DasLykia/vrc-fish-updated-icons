@@ -1585,8 +1585,19 @@ struct FishSliderResult {
 	bool hasBounds;                 // 是否成功检测到滑块边界
 };
 
+static Point2f affineTransformPoint(const Mat& M, const Point2f& p) {
+	// M: 2x3
+	Point2f out{};
+	if (M.empty() || M.rows != 2 || M.cols != 3) {
+		return p;
+	}
+	out.x = (float)(M.at<double>(0, 0) * p.x + M.at<double>(0, 1) * p.y + M.at<double>(0, 2));
+	out.y = (float)(M.at<double>(1, 0) * p.x + M.at<double>(1, 1) * p.y + M.at<double>(1, 2));
+	return out;
+}
+
 static bool fillFishSliderResult(const Mat& gray, const Rect& roi, const TplMatch& fish, const TplMatch& slider,
-	int fishTplHeightHint, FishSliderResult* result) {
+	double trackAngleDeg, int fishTplHeightHint, FishSliderResult* result) {
 	if (!result) return false;
 	*result = FishSliderResult{};
 
@@ -1609,19 +1620,80 @@ static bool fillFishSliderResult(const Mat& gray, const Rect& roi, const TplMatc
 	if (fishTplH <= 0) fishTplH = params.tpl_vr_fish_icon.rows();
 	if (fishTplH > 0 && effectiveMinH < fishTplH + 5) effectiveMinH = fishTplH + 5;
 	int sliderTop = 0, sliderBottom = 0, sliderCenterFromColor = 0;
-	if (detectSliderBoundsWide(gray, roi,
-		&sliderTop, &sliderBottom, &sliderCenterFromColor,
-		config.slider_bright_thresh, effectiveMinH)
-		// 兜底：若整段扫失败，再在 fishX 附近做一次窄条扫描
-		|| detectSliderBounds(gray, fish.center.x, roi,
-			&sliderTop, &sliderBottom, &sliderCenterFromColor,
-			config.slider_bright_thresh, effectiveMinH)) {
-		result->sliderTop = sliderTop;
-		result->sliderBottom = sliderBottom;
-		result->sliderHeight = sliderBottom - sliderTop;
-		result->sliderCenterY = sliderCenterFromColor;  // 用颜色检测的中心覆盖模板匹配的中心
-		result->hasBounds = true;
-	} else {
+	{
+		Rect r = clampRect(roi, gray.size());
+		Mat roiGray = gray(r);
+		Rect localRoi(0, 0, roiGray.cols, roiGray.rows);
+
+		// 旋转矫正：轨道检测得到 angle 后，亮度检测也按同角度把 ROI 旋回到“竖直”再扫（提高鲁棒性）
+		double a = trackAngleDeg;
+		if (!std::isfinite(a)) a = 0.0;
+		Mat scanGray = roiGray; // default: no rotation
+		Mat rotated;
+		Mat M, Minv;
+		int barXLocal = fish.center.x - r.x;
+		int barYLocal = fish.center.y - r.y;
+		if (barXLocal < 0) barXLocal = 0;
+		if (barXLocal >= roiGray.cols) barXLocal = roiGray.cols - 1;
+		if (barYLocal < 0) barYLocal = 0;
+		if (barYLocal >= roiGray.rows) barYLocal = roiGray.rows - 1;
+
+		float barXForMap = (float)barXLocal; // original-local x for mapping
+		if (std::abs(a) > 1e-6 && roiGray.cols > 1 && roiGray.rows > 1) {
+			Point2f c((float)roiGray.cols / 2.0f, (float)roiGray.rows / 2.0f);
+			M = getRotationMatrix2D(c, -a, 1.0);
+			Minv = getRotationMatrix2D(c, +a, 1.0);
+			warpAffine(roiGray, rotated, M, roiGray.size(), INTER_LINEAR, BORDER_CONSTANT, Scalar(0));
+			scanGray = rotated;
+
+			// barX 也需要变换到旋转后的坐标系下（用于窄条扫描兜底 + 反变换坐标）
+			Point2f barRot = affineTransformPoint(M, Point2f((float)barXLocal, (float)barYLocal));
+			barXForMap = barRot.x;
+			if (barXForMap < 0.0f) barXForMap = 0.0f;
+			if (barXForMap > (float)(roiGray.cols - 1)) barXForMap = (float)(roiGray.cols - 1);
+			barXLocal = (int)std::round(barXForMap);
+		}
+
+		int t = 0, b = 0, cy = 0;
+		bool okColor = detectSliderBoundsWide(scanGray, localRoi,
+			&t, &b, &cy,
+			config.slider_bright_thresh, effectiveMinH)
+			|| detectSliderBounds(scanGray, barXLocal, localRoi,
+				&t, &b, &cy,
+				config.slider_bright_thresh, effectiveMinH);
+
+		if (okColor) {
+			// 坐标反变换回原图坐标（保持与 fishY / fixedTrackRoi.y 一致的全图坐标系）
+			if (!Minv.empty()) {
+				Point2f pTop = affineTransformPoint(Minv, Point2f(barXForMap, (float)t));
+				Point2f pBot = affineTransformPoint(Minv, Point2f(barXForMap, (float)b));
+				Point2f pCy = affineTransformPoint(Minv, Point2f(barXForMap, (float)cy));
+				sliderTop = (int)std::round(pTop.y) + r.y;
+				sliderBottom = (int)std::round(pBot.y) + r.y;
+				sliderCenterFromColor = (int)std::round(pCy.y) + r.y;
+			} else {
+				sliderTop = t + r.y;
+				sliderBottom = b + r.y;
+				sliderCenterFromColor = cy + r.y;
+			}
+
+			int maxY = gray.rows > 0 ? (gray.rows - 1) : 0;
+			if (sliderTop < 0) sliderTop = 0;
+			if (sliderTop > maxY) sliderTop = maxY;
+			if (sliderBottom < sliderTop) sliderBottom = sliderTop;
+			if (sliderBottom > gray.rows) sliderBottom = gray.rows;
+			if (sliderCenterFromColor < 0) sliderCenterFromColor = 0;
+			if (sliderCenterFromColor > maxY) sliderCenterFromColor = maxY;
+
+			result->sliderTop = sliderTop;
+			result->sliderBottom = sliderBottom;
+			result->sliderHeight = sliderBottom - sliderTop;
+			result->sliderCenterY = sliderCenterFromColor;  // 用颜色检测的中心覆盖模板匹配的中心
+			result->hasBounds = true;
+		}
+	}
+
+	if (!result->hasBounds) {
 		// 颜色检测失败 → 退回滑块模板（作为兜底）
 		if (slider.score < config.slider_threshold) {
 			return false;
@@ -1657,7 +1729,7 @@ static bool fillFishSliderResult(const Mat& gray, const Rect& roi, const TplMatc
 		TplMatch fish = matchBestRoiAtScaleAndAngle(gray, fishTpl, roi, s, trackAngleDeg, TM_CCOEFF_NORMED);
 		TplMatch slider = matchBestRoi(gray, params.tpl_vr_player_slider, roi, TM_CCORR_NORMED);
 		int fishTplHScaled = (int)std::round((double)fishTpl.rows() * s);
-		return fillFishSliderResult(gray, roi, fish, slider, fishTplHScaled, result);
+		return fillFishSliderResult(gray, roi, fish, slider, trackAngleDeg, fishTplHScaled, result);
 	}
 
 	// 全检测（首帧 + 周期性刷新用）：固定 trackScale/angle 下尝试多鱼模板，输出最佳模板索引
@@ -1685,13 +1757,13 @@ static bool fillFishSliderResult(const Mat& gray, const Rect& roi, const TplMatc
 
 		TplMatch slider = matchBestRoi(gray, params.tpl_vr_player_slider, roi, TM_CCORR_NORMED);
 		int fishTplHScaled = (int)std::round((double)params.tpl_vr_fish_icons[(size_t)bestIdx].rows() * s);
-		bool ok = fillFishSliderResult(gray, roi, fish, slider, fishTplHScaled, result);
+		bool ok = fillFishSliderResult(gray, roi, fish, slider, trackAngleDeg, fishTplHScaled, result);
 		if (!ok) {
 			return false;
 		}
-	if (bestTplIdxOut) *bestTplIdxOut = bestIdx;
-	return true;
-}
+		if (bestTplIdxOut) *bestTplIdxOut = bestIdx;
+		return true;
+	}
 
 // ── MLP 权重加载（为后续推理模式预留） ─────────────────────────
 struct MlpLayer {
