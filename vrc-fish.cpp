@@ -45,6 +45,8 @@ struct g_params {
 	GrayTpl tpl_vr_fish_icon;
 	GrayTpl tpl_vr_fish_icon_alt;
 	GrayTpl tpl_vr_fish_icon_alt2;
+	std::vector<GrayTpl> tpl_vr_fish_icons;           // fish_icon + fish_icon_alt*.png（动态加载）
+	std::vector<std::string> tpl_vr_fish_icon_files;  // 与 tpl_vr_fish_icons 对应的文件名（用于日志/调试）
 	GrayTpl tpl_vr_player_slider;
 };
 
@@ -357,6 +359,43 @@ g_params::GrayTpl loadGrayTplFromFile(const std::string& path) {
 	return tpl;
 }
 
+static g_params::GrayTpl tryLoadGrayTplFromFile(const std::string& path) {
+	Mat raw = imread(path, IMREAD_UNCHANGED);  // 保留 alpha 通道
+	if (raw.empty()) {
+		std::cout << "模板加载失败（忽略）：" << path << endl;
+		return g_params::GrayTpl{};
+	}
+	g_params::GrayTpl tpl{};
+	if (raw.channels() == 4) {
+		// 分离 alpha 通道作为 mask
+		std::vector<Mat> channels;
+		split(raw, channels);
+		Mat alpha = channels[3];
+		// 如果 alpha 不全是 255，说明有透明区域，启用 mask
+		double minA = 0, maxA = 0;
+		minMaxLoc(alpha, &minA, &maxA);
+		Mat bgr;
+		cvtColor(raw, bgr, COLOR_BGRA2BGR);
+		cvtColor(bgr, tpl.gray, COLOR_BGR2GRAY);
+		if (minA < 255.0) {
+			// 二值化 mask：alpha > 0 -> 255, 否则 0
+			threshold(alpha, tpl.mask, 0, 255, THRESH_BINARY);
+			std::cout << "模板已加载（带mask）：" << path << endl;
+		} else {
+			std::cout << "模板已加载：" << path << endl;
+		}
+	} else {
+		Mat bgr = raw;
+		if (raw.channels() == 1) {
+			tpl.gray = raw;
+		} else {
+			cvtColor(bgr, tpl.gray, COLOR_BGR2GRAY);
+		}
+		std::cout << "模板已加载：" << path << endl;
+	}
+	return tpl;
+}
+
 static std::string joinPath(const std::string& dir, const std::string& file) {
 	if (dir.empty()) {
 		return file;
@@ -366,6 +405,87 @@ static std::string joinPath(const std::string& dir, const std::string& file) {
 		return dir + file;
 	}
 	return dir + "\\" + file;
+}
+
+static std::string toLowerAscii(std::string s) {
+	for (char& c : s) {
+		if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+	}
+	return s;
+}
+
+static bool isFishAltIconFilename(const std::string& file) {
+	std::string f = toLowerAscii(file);
+	const std::string prefix = "fish_icon_alt";
+	const std::string suffix = ".png";
+	if (f.size() < prefix.size() + suffix.size()) return false;
+	if (f.rfind(prefix, 0) != 0) return false; // must start with prefix
+	if (f.compare(f.size() - suffix.size(), suffix.size(), suffix) != 0) return false; // must end with .png
+	std::string mid = f.substr(prefix.size(), f.size() - prefix.size() - suffix.size());
+	if (mid.empty()) return true; // fish_icon_alt.png
+	for (char c : mid) {
+		if (c < '0' || c > '9') return false;
+	}
+	return true; // fish_icon_alt123.png
+}
+
+static int parseFishAltIconIndex(const std::string& file) {
+	std::string f = toLowerAscii(file);
+	const std::string prefix = "fish_icon_alt";
+	const std::string suffix = ".png";
+	if (!isFishAltIconFilename(file)) return -1;
+	std::string mid = f.substr(prefix.size(), f.size() - prefix.size() - suffix.size());
+	if (mid.empty()) return -1;
+	int v = 0;
+	for (char c : mid) {
+		if (c < '0' || c > '9') return -1;
+		int d = (int)(c - '0');
+		if (v > 100000000) return -1; // 防溢出/异常文件名
+		v = v * 10 + d;
+	}
+	return v;
+}
+
+static std::vector<std::string> listFilesByWildcard(const std::string& dir, const std::string& wildcard) {
+	std::vector<std::string> out;
+	std::string query = joinPath(dir, wildcard);
+	WIN32_FIND_DATAA ffd{};
+	HANDLE hFind = FindFirstFileA(query.c_str(), &ffd);
+	if (hFind == INVALID_HANDLE_VALUE) {
+		return out;
+	}
+	do {
+		if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+			continue;
+		}
+		if (ffd.cFileName[0] == '\0') {
+			continue;
+		}
+		out.emplace_back(ffd.cFileName);
+	} while (FindNextFileA(hFind, &ffd));
+	FindClose(hFind);
+
+	// 排序：fish_icon_alt.png（无数字）最前，其余按数字升序，最后按字典序兜底
+	std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
+		bool aOk = isFishAltIconFilename(a);
+		bool bOk = isFishAltIconFilename(b);
+		if (aOk != bOk) return aOk; // 合法命名优先
+		if (!aOk) return toLowerAscii(a) < toLowerAscii(b);
+		int ai = parseFishAltIconIndex(a);
+		int bi = parseFishAltIconIndex(b);
+		if (ai != bi) {
+			// -1（无数字）排前面
+			if (ai < 0) return true;
+			if (bi < 0) return false;
+			return ai < bi;
+		}
+		return toLowerAscii(a) < toLowerAscii(b);
+	});
+	out.erase(std::unique(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
+		return toLowerAscii(a) == toLowerAscii(b);
+	}), out.end());
+
+	return out;
 }
 
 // 窗口区域初始化
@@ -457,10 +577,45 @@ void init() {
 	params.tpl_vr_bite_excl_bottom = loadGrayTplFromFile(joinPath(config.resource_dir, config.tpl_bite_exclamation_bottom));
 	params.tpl_vr_bite_excl_full = loadGrayTplFromFile(joinPath(config.resource_dir, config.tpl_bite_exclamation_full));
 	params.tpl_vr_minigame_bar_full = loadGrayTplFromFile(joinPath(config.resource_dir, config.tpl_minigame_bar_full));
-	params.tpl_vr_fish_icon = loadGrayTplFromFile(joinPath(config.resource_dir, config.tpl_fish_icon));
-	params.tpl_vr_fish_icon_alt = loadGrayTplFromFile(joinPath(config.resource_dir, config.tpl_fish_icon_alt));
-	params.tpl_vr_fish_icon_alt2 = loadGrayTplFromFile(joinPath(config.resource_dir, config.tpl_fish_icon_alt2));
 	params.tpl_vr_player_slider = loadGrayTplFromFile(joinPath(config.resource_dir, config.tpl_player_slider));
+
+	// 鱼图标模板：fish_icon + fish_icon_alt*.png（支持 fish_icon_alt3.png / fish_icon_alt10.png ...）
+	params.tpl_vr_fish_icons.clear();
+	params.tpl_vr_fish_icon_files.clear();
+	std::vector<std::string> seenFishFilesLower;
+	auto addFishTplFile = [&](const std::string& file, bool required, g_params::GrayTpl* legacyOut) {
+		if (file.empty()) return;
+		std::string key = toLowerAscii(file);
+		if (std::find(seenFishFilesLower.begin(), seenFishFilesLower.end(), key) != seenFishFilesLower.end()) {
+			return;
+		}
+		g_params::GrayTpl tpl = required
+			? loadGrayTplFromFile(joinPath(config.resource_dir, file))
+			: tryLoadGrayTplFromFile(joinPath(config.resource_dir, file));
+		if (tpl.empty()) {
+			return; // optional failed
+		}
+		seenFishFilesLower.push_back(key);
+		if (legacyOut) *legacyOut = tpl;
+		params.tpl_vr_fish_icons.push_back(tpl);
+		params.tpl_vr_fish_icon_files.push_back(file);
+	};
+
+	// 主模板：必须存在
+	addFishTplFile(config.tpl_fish_icon, true, &params.tpl_vr_fish_icon);
+	// 兼容旧配置：可选
+	addFishTplFile(config.tpl_fish_icon_alt, false, &params.tpl_vr_fish_icon_alt);
+	addFishTplFile(config.tpl_fish_icon_alt2, false, &params.tpl_vr_fish_icon_alt2);
+	// 自动扫描目录：fish_icon_alt数字.png / fish_icon_alt.png
+	for (const std::string& f : listFilesByWildcard(config.resource_dir, "fish_icon_alt*.png")) {
+		if (!isFishAltIconFilename(f)) continue;
+		addFishTplFile(f, false, nullptr);
+	}
+
+	if (params.tpl_vr_fish_icons.empty()) {
+		std::cout << "未加载到任何鱼图标模板，请检查 Resource-VRChat/ 与 tpl_fish_icon 配置。" << endl;
+		exit();
+	}
 }
 
 struct TplMatch {
@@ -783,6 +938,21 @@ static g_params::GrayTpl rotateTplKeepAll(const g_params::GrayTpl& tpl, double a
 		warpAffine(tpl.mask, out.mask, M, Size(outW, outH), INTER_NEAREST, BORDER_CONSTANT, Scalar(0));
 	}
 	return out;
+}
+
+static TplMatch matchBestRoiAtScaleAndAngle(
+	const Mat& srcGray,
+	const g_params::GrayTpl& tpl,
+	Rect roi,
+	double scale,
+	double angleDeg,
+	int method = TM_CCOEFF_NORMED
+) {
+	if (!std::isfinite(scale) || scale <= 0.0) scale = 1.0;
+	if (!std::isfinite(angleDeg)) angleDeg = 0.0;
+	g_params::GrayTpl scaled = makeScaledTpl(tpl, scale);
+	g_params::GrayTpl rotated = rotateTplKeepAll(scaled, angleDeg);
+	return matchBestRoi(srcGray, rotated, roi, method);
 }
 
 struct ScaleMatch {
@@ -1415,7 +1585,8 @@ struct FishSliderResult {
 	bool hasBounds;                 // 是否成功检测到滑块边界
 };
 
-static bool fillFishSliderResult(const Mat& gray, const Rect& roi, const TplMatch& fish, const TplMatch& slider, FishSliderResult* result) {
+static bool fillFishSliderResult(const Mat& gray, const Rect& roi, const TplMatch& fish, const TplMatch& slider,
+	int fishTplHeightHint, FishSliderResult* result) {
 	if (!result) return false;
 	*result = FishSliderResult{};
 
@@ -1434,7 +1605,8 @@ static bool fillFishSliderResult(const Mat& gray, const Rect& roi, const TplMatc
 	// 颜色检测：优先在整个轨道 ROI 内扫亮度线条（不依赖滑块模板分数/位置）
 	// minSliderHeight 过小会把“鱼图标”这种短亮段误当成滑块，这里做个下限保护
 	int effectiveMinH = config.slider_min_height;
-	int fishTplH = params.tpl_vr_fish_icon.rows();
+	int fishTplH = fishTplHeightHint;
+	if (fishTplH <= 0) fishTplH = params.tpl_vr_fish_icon.rows();
 	if (fishTplH > 0 && effectiveMinH < fishTplH + 5) effectiveMinH = fishTplH + 5;
 	int sliderTop = 0, sliderBottom = 0, sliderCenterFromColor = 0;
 	if (detectSliderBoundsWide(gray, roi,
@@ -1464,55 +1636,59 @@ static bool fillFishSliderResult(const Mat& gray, const Rect& roi, const TplMatc
 	return true;
 }
 
-// 快速检测（控制循环用）：单尺度 + 单鱼模板，仅 2 次 matchTemplate
-// cachedFishScale: 上次多尺度匹配得到的最佳缩放比
-// cachedFishTplIdx: 0=fish_icon, 1=fish_icon_alt, 2=fish_icon_alt2
-static bool detectFishAndSliderFast(const Mat& gray, const Rect& barRect, FishSliderResult* result,
-	double cachedFishScale, int cachedFishTplIdx) {
-	Rect roi = clampRect(barRect, gray.size());
-	if (roi.width <= 0 || roi.height <= 0) return false;
+	// 快速检测（控制循环用）：固定 trackScale/angle + 单鱼模板，仅 2 次 matchTemplate
+	// cachedFishTplIdx: params.tpl_vr_fish_icons 的索引（fish_icon + fish_icon_alt*.png）
+	static bool detectFishAndSliderFast(const Mat& gray, const Rect& barRect, FishSliderResult* result,
+		double trackScale, double trackAngleDeg, int cachedFishTplIdx) {
+		Rect roi = clampRect(barRect, gray.size());
+		if (roi.width <= 0 || roi.height <= 0) return false;
 
-	const auto& fishTpl = (cachedFishTplIdx == 2) ? params.tpl_vr_fish_icon_alt2
-		: (cachedFishTplIdx == 1) ? params.tpl_vr_fish_icon_alt : params.tpl_vr_fish_icon;
-	TplMatch fish = matchBestRoiAtScale(gray, fishTpl, roi, cachedFishScale);
-	TplMatch slider = matchBestRoi(gray, params.tpl_vr_player_slider, roi, TM_CCORR_NORMED);
-	return fillFishSliderResult(gray, roi, fish, slider, result);
-}
+		double s = trackScale;
+		if (!std::isfinite(s) || s <= 0.0) s = 1.0;
 
-// 全检测（首帧 + 周期性刷新用）：多尺度 + 双鱼模板，输出最佳缩放/模板索引
-static bool detectFishAndSliderFull(const Mat& gray, const Rect& barRect, FishSliderResult* result,
-	double* bestScaleOut, int* bestTplIdxOut) {
-	Rect roi = clampRect(barRect, gray.size());
-	if (roi.width <= 0 || roi.height <= 0) return false;
-
-	double scale1 = 1.0, scale2 = 1.0, scale3 = 1.0;
-	TplMatch fish1 = matchBestRoiMultiScale(gray, params.tpl_vr_fish_icon, roi, TM_CCOEFF_NORMED, &scale1);
-	TplMatch fish2 = matchBestRoiMultiScale(gray, params.tpl_vr_fish_icon_alt, roi, TM_CCOEFF_NORMED, &scale2);
-	TplMatch fish3{};
-	if (!params.tpl_vr_fish_icon_alt2.empty())
-		fish3 = matchBestRoiMultiScale(gray, params.tpl_vr_fish_icon_alt2, roi, TM_CCOEFF_NORMED, &scale3);
-
-	TplMatch fish{};
-	int bestIdx = 0;
-	double bestScale = scale1;
-	if (fish1.score >= fish2.score && fish1.score >= fish3.score) {
-		fish = fish1;
-	} else if (fish2.score >= fish1.score && fish2.score >= fish3.score) {
-		fish = fish2;
-		bestIdx = 1;
-		bestScale = scale2;
-	} else {
-		fish = fish3;
-		bestIdx = 2;
-		bestScale = scale3;
+		const g_params::GrayTpl* fishTplPtr = &params.tpl_vr_fish_icon;
+		if (!params.tpl_vr_fish_icons.empty()) {
+			int idx = cachedFishTplIdx;
+			if (idx < 0) idx = 0;
+			if (idx >= (int)params.tpl_vr_fish_icons.size()) idx = 0;
+			fishTplPtr = &params.tpl_vr_fish_icons[(size_t)idx];
+		}
+		const auto& fishTpl = *fishTplPtr;
+		TplMatch fish = matchBestRoiAtScaleAndAngle(gray, fishTpl, roi, s, trackAngleDeg, TM_CCOEFF_NORMED);
+		TplMatch slider = matchBestRoi(gray, params.tpl_vr_player_slider, roi, TM_CCORR_NORMED);
+		int fishTplHScaled = (int)std::round((double)fishTpl.rows() * s);
+		return fillFishSliderResult(gray, roi, fish, slider, fishTplHScaled, result);
 	}
 
-	TplMatch slider = matchBestRoi(gray, params.tpl_vr_player_slider, roi, TM_CCORR_NORMED);
-	bool ok = fillFishSliderResult(gray, roi, fish, slider, result);
-	if (!ok) {
-		return false;
-	}
-	if (bestScaleOut) *bestScaleOut = bestScale;
+	// 全检测（首帧 + 周期性刷新用）：固定 trackScale/angle 下尝试多鱼模板，输出最佳模板索引
+	static bool detectFishAndSliderFull(const Mat& gray, const Rect& barRect, FishSliderResult* result,
+		double trackScale, double trackAngleDeg, int* bestTplIdxOut) {
+		Rect roi = clampRect(barRect, gray.size());
+		if (roi.width <= 0 || roi.height <= 0) return false;
+
+		double s = trackScale;
+		if (!std::isfinite(s) || s <= 0.0) s = 1.0;
+
+		if (params.tpl_vr_fish_icons.empty()) {
+			return false;
+		}
+		TplMatch fish{};
+		int bestIdx = 0;
+		for (size_t i = 0; i < params.tpl_vr_fish_icons.size(); i++) {
+			const auto& tpl = params.tpl_vr_fish_icons[i];
+			TplMatch m = matchBestRoiAtScaleAndAngle(gray, tpl, roi, s, trackAngleDeg, TM_CCOEFF_NORMED);
+			if (m.score > fish.score) {
+				fish = m;
+				bestIdx = (int)i;
+			}
+		}
+
+		TplMatch slider = matchBestRoi(gray, params.tpl_vr_player_slider, roi, TM_CCORR_NORMED);
+		int fishTplHScaled = (int)std::round((double)params.tpl_vr_fish_icons[(size_t)bestIdx].rows() * s);
+		bool ok = fillFishSliderResult(gray, roi, fish, slider, fishTplHScaled, result);
+		if (!ok) {
+			return false;
+		}
 	if (bestTplIdxOut) *bestTplIdxOut = bestIdx;
 	return true;
 }
@@ -1639,10 +1815,11 @@ void fishVrchat() {
 	Rect fixedTrackRoi{};          // 首帧定位的固定轨道 ROI（整局不变）
 	bool hasFixedTrack = false;    // 是否已定位轨道
 
-	// 快速检测缓存：首帧多尺度确定最佳缩放和模板，后续帧复用
-	double cachedFishScale = 1.0;
-	int    cachedFishTplIdx = 0;     // 0=fish_icon, 1=fish_icon_alt
-	bool   hasCachedScale = false;
+			// 快速检测缓存：首帧多尺度确定最佳缩放和模板，后续帧复用
+			double cachedTrackScale = 1.0;
+			double cachedTrackAngle = 0.0;
+			int    cachedFishTplIdx = 0;     // params.tpl_vr_fish_icons 的索引
+			bool   hasCachedFishTpl = false;
 
 		// ML 录制模式状态
 		std::ofstream recordFile;
@@ -1787,14 +1964,16 @@ void fishVrchat() {
 			minigameMissingFrames = 0;
 			hasPrevSlider = false;
 			hasPrevFish = false;
-			smoothVelocity = 0.0;
-			smoothFishVel = 0.0;
-			hasFixedTrack = false;
-			hasCachedScale = false;
-			hasPrevTs = false;
-			lastDtRatio = 1.0;
-			lastGoodSliderH = 0;
-			lastGoodSliderCY = 0;
+				smoothVelocity = 0.0;
+				smoothFishVel = 0.0;
+				hasFixedTrack = false;
+				cachedTrackScale = 1.0;
+				cachedTrackAngle = 0.0;
+				hasCachedFishTpl = false;
+				hasPrevTs = false;
+				lastDtRatio = 1.0;
+				lastGoodSliderH = 0;
+				lastGoodSliderCY = 0;
 			hasLastGoodPos = false;
 			consecutiveMiss = 0;
 
@@ -1862,38 +2041,45 @@ void fishVrchat() {
 				}
 			};
 
-			Rect searchRoi = centerThirdStripRoi(gray.size());
-
-					// ── 首帧：用 minigame_bar_full 模板定位完整轨道，取右半部分作为滑块/鱼检测 ROI ──
-					if (!hasFixedTrack) {
-						double barScale = 1.0;
-						double barAngle = 0.0;
-						TplMatch barMatch = matchBestRoiTrackBarAutoScale(gray, params.tpl_vr_minigame_bar_full, searchRoi,
-							TM_CCOEFF_NORMED, &barScale, &barAngle);
-						if (barMatch.score >= config.minigame_threshold) {
+				Rect searchRoi = centerThirdStripRoi(gray.size());
+				// ── 首帧：用 minigame_bar_full 模板定位完整轨道，取右半部分作为滑块/鱼检测 ROI ──
+				if (!hasFixedTrack) {
+					double barScale = 1.0;
+					double barAngle = 0.0;
+					TplMatch barMatch = matchBestRoiTrackBarAutoScale(
+						gray,
+						params.tpl_vr_minigame_bar_full,
+						searchRoi,
+						TM_CCOEFF_NORMED,
+						&barScale,
+						&barAngle
+					);
+					if (barMatch.score >= config.minigame_threshold) {
 						// 轨道定位成功：取匹配区域的右半部分作为滑块和鱼的检测区域
 						int trackX = barMatch.rect.x;
 						int trackW = barMatch.rect.width;
-					int trackY = barMatch.rect.y;
-					int trackH = barMatch.rect.height;
-					// 右半区域起点 = 匹配区域中点，宽度 = 一半宽度
-					int halfX = trackX + trackW / 2;
-					int halfW = trackW - trackW / 2;
-					// 垂直方向多扩展一些（鱼可能超出轨道模板范围）
-					int padY = config.track_pad_y;
-					if (padY < 0) padY = 0;
-					fixedTrackRoi = Rect(
-						halfX,
-						trackY - padY,
-						halfW,
-						trackH + padY * 2
-					);
-					fixedTrackRoi = clampRect(fixedTrackRoi, gray.size());
-					hasFixedTrack = true;
-					// debug: 蓝框=搜索区域, 绿框=模板匹配位置, 红框=最终锁定ROI
-					saveDebugFrame(frame, "track_lock", searchRoi, barMatch.rect, fixedTrackRoi);
-					if (config.vr_debug || vrLogFile.is_open()) {
-						std::ostringstream oss;
+						int trackY = barMatch.rect.y;
+						int trackH = barMatch.rect.height;
+						// 右半区域起点 = 匹配区域中点，宽度 = 一半宽度
+						int halfX = trackX + trackW / 2;
+						int halfW = trackW - trackW / 2;
+						// 垂直方向多扩展一些（鱼可能超出轨道模板范围）
+						int padY = config.track_pad_y;
+						if (padY < 0) padY = 0;
+						fixedTrackRoi = Rect(
+							halfX,
+							trackY - padY,
+							halfW,
+							trackH + padY * 2
+						);
+						fixedTrackRoi = clampRect(fixedTrackRoi, gray.size());
+						hasFixedTrack = true;
+						cachedTrackScale = barScale;
+						cachedTrackAngle = barAngle;
+						// debug: 蓝框=搜索区域, 绿框=模板匹配位置, 红框=最终锁定ROI
+						saveDebugFrame(frame, "track_lock", searchRoi, barMatch.rect, fixedTrackRoi);
+						if (config.vr_debug || vrLogFile.is_open()) {
+							std::ostringstream oss;
 							oss << "[ctrl] track locked (full tpl): x=" << fixedTrackRoi.x
 								<< " y=" << fixedTrackRoi.y
 								<< " w=" << fixedTrackRoi.width
@@ -1904,64 +2090,59 @@ void fishVrchat() {
 							writeVrLogLine(oss.str(), config.vr_debug);
 						}
 					} else {
-					// debug: 蓝框=搜索区域, 绿框=匹配到的(错误)位置
-					saveDebugFrame(frame, "track_miss", searchRoi, barMatch.rect);
-					minigameMissingFrames++;
-					// 轨道长期定位不上（>= end_confirm_frames * N 帧）：放弃，退出小游戏
-					int trackLockMaxMiss = config.game_end_confirm_frames * config.track_lock_miss_multiplier;
-					if (trackLockMaxMiss < config.track_lock_miss_min_frames) trackLockMaxMiss = config.track_lock_miss_min_frames;
+						// debug: 蓝框=搜索区域, 绿框=匹配到的(错误)位置
+						saveDebugFrame(frame, "track_miss", searchRoi, barMatch.rect);
+						minigameMissingFrames++;
+						// 轨道长期定位不上（>= end_confirm_frames * N 帧）：放弃，退出小游戏
+						int trackLockMaxMiss = config.game_end_confirm_frames * config.track_lock_miss_multiplier;
+						if (trackLockMaxMiss < config.track_lock_miss_min_frames) trackLockMaxMiss = config.track_lock_miss_min_frames;
 						if (config.vr_debug || vrLogFile.is_open()) {
-								std::ostringstream oss;
-								oss << "[ctrl] track detect MISS (score=" << barMatch.score
-									<< " scale=" << barScale
-									<< " angle=" << barAngle
-									<< ") miss=" << minigameMissingFrames << "/" << trackLockMaxMiss;
-								writeVrLogLine(oss.str(), config.vr_debug);
-							}
-					if (minigameMissingFrames >= trackLockMaxMiss) {
-						if (holding) { mouseLeftUp(); holding = false; }
-						saveDebugFrame(frame, "track_lock_timeout", searchRoi);
-						switchState(VrFishState::PostMinigame);
+							std::ostringstream oss;
+							oss << "[ctrl] track detect MISS (score=" << barMatch.score
+								<< " scale=" << barScale
+								<< " angle=" << barAngle
+								<< ") miss=" << minigameMissingFrames << "/" << trackLockMaxMiss;
+							writeVrLogLine(oss.str(), config.vr_debug);
+						}
+						if (minigameMissingFrames >= trackLockMaxMiss) {
+							if (holding) { mouseLeftUp(); holding = false; }
+							saveDebugFrame(frame, "track_lock_timeout", searchRoi);
+							switchState(VrFishState::PostMinigame);
+						}
+						sleepControlInterval();
+						continue;
 					}
-					sleepControlInterval();
-					continue;
 				}
-			}
-
-			Rect matchRoi = fixedTrackRoi;
-
-			FishSliderResult det;
-			bool ok = false;
-			bool didFullDetect = false;
-			// 首帧用全检测（多尺度+双模板）确定最佳缩放/模板
-			// 后续帧始终用快速路径（单尺度+单模板）
-			// 只在快速路径失败时才回退到全检测
-			if (!hasCachedScale) {
-				double bestScale = 1.0;
-				int bestIdx = 0;
-				ok = detectFishAndSliderFull(gray, matchRoi, &det, &bestScale, &bestIdx);
-				if (ok) {
-					cachedFishScale = bestScale;
-					cachedFishTplIdx = bestIdx;
-					hasCachedScale = true;
-				}
-				didFullDetect = true;
-			} else {
-				ok = detectFishAndSliderFast(gray, matchRoi, &det, cachedFishScale, cachedFishTplIdx);
-				if (!ok) {
-					// 快速路径失败，尝试全检测（可能鱼图标变了）
-					double bestScale = 1.0;
+	
+				Rect matchRoi = fixedTrackRoi;
+	
+				FishSliderResult det;
+				bool ok = false;
+				bool didFullDetect = false;
+				// 首帧：在已锁定轨道的 scale/angle 下，选择最匹配的鱼模板索引
+				// 后续帧：固定 scale/angle + 单模板快速检测
+				// 只在快速路径失败时才回退到全检测（可能鱼图标模板变了）
+				if (!hasCachedFishTpl) {
 					int bestIdx = 0;
-					ok = detectFishAndSliderFull(gray, matchRoi, &det, &bestScale, &bestIdx);
+					ok = detectFishAndSliderFull(gray, matchRoi, &det, cachedTrackScale, cachedTrackAngle, &bestIdx);
 					if (ok) {
-						cachedFishScale = bestScale;
 						cachedFishTplIdx = bestIdx;
+						hasCachedFishTpl = true;
 					}
 					didFullDetect = true;
+				} else {
+					ok = detectFishAndSliderFast(gray, matchRoi, &det, cachedTrackScale, cachedTrackAngle, cachedFishTplIdx);
+					if (!ok) {
+						int bestIdx = 0;
+						ok = detectFishAndSliderFull(gray, matchRoi, &det, cachedTrackScale, cachedTrackAngle, &bestIdx);
+						if (ok) {
+							cachedFishTplIdx = bestIdx;
+						}
+						didFullDetect = true;
+					}
 				}
-			}
-
-			unsigned long long detectMs = nowMs() - loopStart;
+	
+				unsigned long long detectMs = nowMs() - loopStart;
 
 			if (!ok) {
 				if (config.vr_debug || vrLogFile.is_open()) {

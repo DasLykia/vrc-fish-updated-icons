@@ -91,7 +91,7 @@
 
 仓库中的模板截图和默认参数基于我自己的钓鱼位点（地图初始岛屿**椰子湾的木栈桥尽头**，模型高度 **1.1 米**），不同的站位、模型和鱼竿可能需要做以下调整：
 
-- **日志中出现大量 miss**：最有效的方法是在你自己的位点手动截图/抠图，替换 `Resource-VRChat/` 文件夹中的模板图片，或微调 `config.ini` 中的匹配阈值（`bite_threshold`、`fish_icon_threshold` 等）和缩放参数（`fish_scale_*`、`track_scale_*`）。
+- **日志中出现大量 miss**：最有效的方法是在你自己的位点手动截图/抠图，替换 `Resource-VRChat/` 文件夹中的模板图片，或微调 `config.ini` 中的匹配阈值（`bite_threshold`、`fish_icon_threshold` 等）以及轨道的缩放/旋转搜索参数（`track_scale_*` / `track_scale_min`/`track_scale_max`/`track_scale_step` / `track_angle_*`）。
 - **绿色稀有度以上的鱼**：目前对快速运动的鱼（蓝色、紫色等稀有鱼）的跟踪仍在优化中；同时仓库只截取了绿、紫、白三种鱼的图标模板，其他颜色的鱼容易出现丢追，欢迎自行截取补充。
 - **不同电脑/显示环境**：识别效果与屏幕分辨率、渲染设置关系较大，具体的匹配阈值和控制参数可能需要根据自己的环境做调整。
 
@@ -117,7 +117,7 @@
 | `vrchat_fish` | `force_resolution` / `target_width` / `target_height` | 是否强制调整 VRChat 客户区分辨率 |
 | `vrchat_fish` | `capture_interval_ms` / `control_interval_ms` | 截图轮询与控制循环间隔 |
 | `vrchat_fish` | `bite_threshold` / `minigame_threshold` / `fish_icon_threshold` / `slider_threshold` | 关键模板匹配阈值（0~1） |
-| `vrchat_fish` | `fish_scale_*` / `track_scale_*` / `track_scale_min`/`track_scale_max`/`track_scale_step` / `track_angle_min`/`track_angle_max`/`track_angle_step` | 多尺度模板匹配缩放比（鱼图标/滑块轨道）；轨道支持按范围自动扫尺度+小角度旋转匹配 |
+| `vrchat_fish` | `track_scale_*` / `track_scale_min`/`track_scale_max`/`track_scale_step` / `track_angle_min`/`track_angle_max`/`track_angle_step` | 轨道模板的缩放/旋转搜索参数（用于锁定轨道 ROI），支持按范围自动扫尺度+小角度旋转匹配 |
 | `vrchat_fish` | `cleanup_*` / `cleanup_reel_key` | 结算/清理到下一轮：等待、点击次数、收杆按键等 |
 | `vrchat_fish` | `ml_mode` / `ml_record_csv` / `ml_weights_file` | 0=自动控制，1=录制数据，2=ML 推理 |
 | `vrchat_fish` | `debug` / `debug_pic` / `debug_dir` / `vr_log_file` | 调试输出、截图保存与 CSV 日志 |
@@ -125,6 +125,7 @@
 资源模板：
 - 默认目录：`Resource-VRChat/`
 - 可通过 `tpl_*` 配置项改名或替换模板文件（咬钩感叹号、轨道、鱼图标、玩家滑块等）
+- 鱼图标支持自动加载 `fish_icon_alt*.png`（例如 `fish_icon_alt3.png`），无需在配置中逐个添加
 
 ## 日志与调试
 

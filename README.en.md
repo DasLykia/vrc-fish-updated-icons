@@ -91,7 +91,7 @@ Notes:
 
 The bundled templates and default parameters are based on my own fishing spot (the **end of the wooden pier at Coconut Bay**, the starting island, with an avatar height of **1.1 m**). Different positions, avatars, and fishing rods may require adjustments:
 
-- **Lots of "miss" in the logs**: The most effective fix is to take your own screenshots at your fishing spot, crop the UI elements, and replace the images in `Resource-VRChat/`. You can also tweak the matching thresholds (`bite_threshold`, `fish_icon_threshold`, etc.) and scale parameters (`fish_scale_*`, `track_scale_*`) in `config.ini`.
+- **Lots of "miss" in the logs**: The most effective fix is to take your own screenshots at your fishing spot, crop the UI elements, and replace the images in `Resource-VRChat/`. You can also tweak matching thresholds (`bite_threshold`, `fish_icon_threshold`, etc.) and the track scale/angle scan parameters (`track_scale_*` / `track_scale_min`/`track_scale_max`/`track_scale_step` / `track_angle_*`) in `config.ini`.
 - **Fish above Green rarity**: Tracking of fast-moving fish (Blue, Purple, and other rare fish) is still being improved. The repo currently only includes icon templates for Green, Purple, and White fish—other colors are more likely to lose tracking. Contributions of additional fish icon templates are welcome.
 - **Different PC / display environments**: Detection accuracy is sensitive to screen resolution and rendering settings. You may need to adjust thresholds and control parameters for your specific setup.
 
@@ -114,13 +114,14 @@ Key highlights:
 - Window matching: `window_class`, `window_title_contains`
 - Resolution: `force_resolution`, `target_width`, `target_height`
 - Thresholds: `bite_threshold`, `minigame_threshold`, `fish_icon_threshold`, `slider_threshold`
-- Multi-scale template matching: `fish_scale_*` (fish icons), `track_scale_*` / `track_scale_min`/`track_scale_max`/`track_scale_step` / `track_angle_*` (minigame track; range-based scale+angle scan supported)
+- Template matching: track lock uses `track_scale_*` / `track_scale_min`/`track_scale_max`/`track_scale_step` / `track_angle_*` (range-based scale+angle scan supported)
 - Cleanup loop: `cleanup_*`, `cleanup_reel_key`
 - ML: `ml_mode` (0=auto, 1=record, 2=infer), `ml_record_csv`, `ml_weights_file`
 - Debug/log: `debug`, `debug_pic`, `debug_dir`, `vr_log_file`
 
 Templates:
 - Default directory: `Resource-VRChat/` (override via `tpl_*` keys)
+- Fish icons: auto-loads `fish_icon_alt*.png` (e.g. `fish_icon_alt3.png`) without requiring config entries
 
 ## Logging & Debugging
 
